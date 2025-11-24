@@ -1,115 +1,230 @@
+
 from flask import Flask, jsonify, render_template_string, request
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 import time
 import traceback
+from datetime import datetime
 
 app = Flask(__name__)
 
 # ======================= CONEXIÓN POSTGRES RENDER =======================
 def get_db_connection():
+    """Conectar a PostgreSQL con manejo de errores mejorado"""
     try:
+        # Opción 1: Variables de entorno de Render (RECOMENDADO)
         conn = psycopg2.connect(
-            host='dpg-d4i8haemcj7s73cf1uo0-a',
-            database='cobot_db',
-            user='mi_usuario',
-            password='IRaaPDN3beLQ5qWOHMoqIpHShRENh09o',
-            port=5432,
-            connect_timeout=10
+            host=os.environ.get('POSTGRES_HOST', 'dpg-d4i8haemcj7s73cf1uo0-a'),
+            database=os.environ.get('POSTGRES_DATABASE', 'cobot_db'),
+            user=os.environ.get('POSTGRES_USER', 'mi_usuario'),
+            password=os.environ.get('POSTGRES_PASSWORD', 'IRaaPDN3beLQ5qWOHMoqIpHShRENh09o'),
+            port=os.environ.get('POSTGRES_PORT', 5432),
+            connect_timeout=10,
+            cursor_factory=RealDictCursor  # Para obtener resultados como diccionarios
         )
+        print("✅ Conexión PostgreSQL exitosa")
         return conn
     except Exception as e:
         print(f"❌ Error conectando a PostgreSQL: {e}")
         return None
 
-# ======================= CONFIGURACIÓN INICIAL =======================
-def setup_database():
+# ======================= CONSULTAS ESPECÍFICAS =======================
+def ejecutar_consulta(query, params=None, fetch=False):
+    """Ejecutar consultas de manera segura"""
+    conn = None
     try:
         conn = get_db_connection()
         if conn is None:
-            print("❌ No se pudo conectar a la base de datos PostgreSQL")
-            return False
+            return None
             
         cursor = conn.cursor()
+        cursor.execute(query, params or ())
         
-        # Crear tablas si no existen
-        cursor.execute('''
+        if fetch:
+            if 'SELECT' in query.upper():
+                result = cursor.fetchall()
+            else:
+                result = None
+        else:
+            conn.commit()
+            result = None
+            
+        cursor.close()
+        return result
+        
+    except Exception as e:
+        print(f"❌ Error en consulta: {e}")
+        if conn:
+            conn.rollback()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+# ======================= CREACIÓN DE TABLAS =======================
+def setup_database():
+    """Crear todas las tablas necesarias"""
+    try:
+        print("🔄 Configurando base de datos PostgreSQL...")
+        
+        # Tabla de comandos del robot
+        ejecutar_consulta('''
             CREATE TABLE IF NOT EXISTS comandos_robot (
                 id SERIAL PRIMARY KEY,
-                esp32_id VARCHAR(50),
-                comando VARCHAR(100),
+                esp32_id VARCHAR(50) NOT NULL DEFAULT 'CDBOT_001',
+                comando VARCHAR(100) NOT NULL,
                 parametros TEXT,
-                motor_num INT,
-                pasos INT,
-                velocidad INT,
+                motor_num INTEGER,
+                pasos INTEGER,
+                velocidad INTEGER,
                 direccion VARCHAR(10),
-                posicion_m1 FLOAT,
-                posicion_m2 FLOAT,
-                posicion_m3 FLOAT,
-                posicion_m4 FLOAT,
+                posicion_m1 FLOAT DEFAULT 0,
+                posicion_m2 FLOAT DEFAULT 0,
+                posicion_m3 FLOAT DEFAULT 0,
+                posicion_m4 FLOAT DEFAULT 0,
                 garra_estado VARCHAR(10),
-                modo_conexion VARCHAR(20),
+                modo_conexion VARCHAR(20) DEFAULT 'SERIAL',
                 ejecutado BOOLEAN DEFAULT FALSE,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        cursor.execute('''
+        # Tabla de estado del robot
+        ejecutar_consulta('''
             CREATE TABLE IF NOT EXISTS moduls_tellis (
                 id SERIAL PRIMARY KEY,
-                esp32_id VARCHAR(50),
-                motores_activos BOOLEAN,
-                emergency_stop BOOLEAN,
-                posicion_m1 FLOAT,
-                posicion_m2 FLOAT,
-                posicion_m3 FLOAT,
-                posicion_m4 FLOAT,
-                garra_abierta BOOLEAN,
-                velocidad_actual INT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                esp32_id VARCHAR(50) UNIQUE NOT NULL DEFAULT 'CDBOT_001',
+                motores_activos BOOLEAN DEFAULT TRUE,
+                emergency_stop BOOLEAN DEFAULT FALSE,
+                posicion_m1 FLOAT DEFAULT 0,
+                posicion_m2 FLOAT DEFAULT 0,
+                posicion_m3 FLOAT DEFAULT 0,
+                posicion_m4 FLOAT DEFAULT 0,
+                garra_abierta BOOLEAN DEFAULT TRUE,
+                velocidad_actual INTEGER DEFAULT 500,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                actualizado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        cursor.execute('''
+        # Tabla de posiciones guardadas
+        ejecutar_consulta('''
             CREATE TABLE IF NOT EXISTS posiciones_guardadas (
                 id SERIAL PRIMARY KEY,
-                nombre VARCHAR(100),
-                posicion_m1 FLOAT,
-                posicion_m2 FLOAT,
-                posicion_m3 FLOAT,
-                posicion_m4 FLOAT,
-                garra_estado VARCHAR(10),
-                velocidad INT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                nombre VARCHAR(100) UNIQUE NOT NULL,
+                descripcion TEXT,
+                posicion_m1 FLOAT DEFAULT 0,
+                posicion_m2 FLOAT DEFAULT 0,
+                posicion_m3 FLOAT DEFAULT 0,
+                posicion_m4 FLOAT DEFAULT 0,
+                garra_estado VARCHAR(10) DEFAULT 'ABIERTA',
+                velocidad INTEGER DEFAULT 500,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
         # Insertar estado inicial si no existe
-        cursor.execute("SELECT * FROM moduls_tellis WHERE esp32_id = 'CDBOT_001'")
-        if not cursor.fetchone():
-            cursor.execute('''
+        estado_existente = ejecutar_consulta(
+            "SELECT * FROM moduls_tellis WHERE esp32_id = 'CDBOT_001'",
+            fetch=True
+        )
+        
+        if not estado_existente:
+            ejecutar_consulta('''
                 INSERT INTO moduls_tellis 
-                (esp32_id, motores_activos, emergency_stop, posicion_m1, posicion_m2, posicion_m3, posicion_m4, garra_abierta, velocidad_actual) 
+                (esp32_id, motores_activos, emergency_stop, posicion_m1, posicion_m2, 
+                 posicion_m3, posicion_m4, garra_abierta, velocidad_actual) 
                 VALUES 
                 ('CDBOT_001', TRUE, FALSE, 0, 0, 0, 0, TRUE, 500)
             ''')
+            print("✅ Estado inicial del robot creado")
         
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print("✅ BASE DE DATOS POSTGRESQL CONFIGURADA CORRECTAMENTE")
+        # Insertar algunas posiciones de ejemplo
+        posiciones_ejemplo = [
+            ('HOME', 'Posición inicial', 0, 0, 0, 0, 'ABIERTA', 500),
+            ('PICK', 'Posición para recoger', 45, 90, 30, 60, 'CERRADA', 300),
+            ('PLACE', 'Posición para colocar', 90, 45, 60, 30, 'ABIERTA', 400)
+        ]
+        
+        for nombre, desc, m1, m2, m3, m4, garra, vel in posiciones_ejemplo:
+            ejecutar_consulta('''
+                INSERT INTO posiciones_guardadas 
+                (nombre, descripcion, posicion_m1, posicion_m2, posicion_m3, posicion_m4, garra_estado, velocidad)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (nombre) DO NOTHING
+            ''', (nombre, desc, m1, m2, m3, m4, garra, vel))
+        
+        print("✅ Base de datos PostgreSQL configurada correctamente")
         return True
         
     except Exception as e:
         print(f"❌ Error configurando BD PostgreSQL: {e}")
         return False
 
+# ======================= CONSULTAS ESPECÍFICAS AVANZADAS =======================
+def obtener_estado_robot():
+    """Obtener estado actual del robot"""
+    return ejecutar_consulta(
+        "SELECT * FROM moduls_tellis WHERE esp32_id = 'CDBOT_001' ORDER BY actualizado_en DESC LIMIT 1",
+        fetch=True
+    )
+
+def obtener_comandos_pendientes():
+    """Obtener comandos no ejecutados"""
+    return ejecutar_consulta(
+        "SELECT * FROM comandos_robot WHERE ejecutado = FALSE ORDER BY timestamp ASC LIMIT 10",
+        fetch=True
+    )
+
+def obtener_ultimos_comandos(limite=5):
+    """Obtener últimos comandos ejecutados"""
+    return ejecutar_consulta(
+        "SELECT * FROM comandos_robot ORDER BY timestamp DESC LIMIT %s",
+        (limite,),
+        fetch=True
+    )
+
+def crear_comando(comando, **kwargs):
+    """Crear nuevo comando para el robot"""
+    campos = ['esp32_id', 'comando', 'motor_num', 'pasos', 'velocidad', 'direccion', 
+              'posicion_m1', 'posicion_m2', 'posicion_m3', 'posicion_m4', 'modo_conexion']
+    
+    valores = [kwargs.get(campo) for campo in campos]
+    valores[0] = valores[0] or 'CDBOT_001'  # esp32_id por defecto
+    valores[1] = comando  # comando principal
+    
+    placeholders = ', '.join(['%s'] * len(campos))
+    campos_str = ', '.join(campos)
+    
+    query = f"INSERT INTO comandos_robot ({campos_str}) VALUES ({placeholders})"
+    return ejecutar_consulta(query, valores)
+
+def actualizar_estado_robot(**estado):
+    """Actualizar estado del robot"""
+    campos = ['motores_activos', 'emergency_stop', 'posicion_m1', 'posicion_m2', 
+              'posicion_m3', 'posicion_m4', 'garra_abierta', 'velocidad_actual']
+    
+    sets = ', '.join([f"{campo} = %s" for campo in campos])
+    valores = [estado.get(campo) for campo in campos]
+    valores.append('CDBOT_001')  # para el WHERE
+    
+    query = f'''
+        INSERT INTO moduls_tellis (esp32_id, {', '.join(campos)})
+        VALUES ('CDBOT_001', {', '.join(['%s'] * len(campos))})
+        ON CONFLICT (esp32_id) DO UPDATE SET 
+        {sets}, actualizado_en = CURRENT_TIMESTAMP
+    '''
+    
+    return ejecutar_consulta(query, valores * 2)  # Duplicar valores para INSERT y UPDATE
+
 # Configurar base de datos al inicio
-print("🚀 Iniciando configuración de base de datos PostgreSQL...")
+print("🚀 Iniciando aplicación Flask con PostgreSQL...")
 setup_database()
 
-# ======================= HTML DASHBOARD (EL MISMO) =======================
+# ======================= HTML DASHBOARD (MISMO QUE ANTES) =======================
 HTML_DASHBOARD = '''
 <!DOCTYPE html>
 <html>
@@ -630,26 +745,35 @@ HTML_DASHBOARD = '''
 def dashboard():
     return render_template_string(HTML_DASHBOARD)
 
+@app.route('/api/estado')
+def obtener_estado():
+    """Obtener estado actual del robot"""
+    try:
+        estado = obtener_estado_robot()
+        if estado:
+            estado = estado[0]  # Tomar el primer resultado
+            return jsonify({
+                "motores_activos": bool(estado['motores_activos']),
+                "emergency_stop": bool(estado['emergency_stop']), 
+                "posicion_m1": float(estado['posicion_m1']),
+                "posicion_m2": float(estado['posicion_m2']),
+                "posicion_m3": float(estado['posicion_m3']),
+                "posicion_m4": float(estado['posicion_m4']),
+                "garra_abierta": bool(estado['garra_abierta']),
+                "velocidad_actual": int(estado['velocidad_actual'])
+            })
+        else:
+            return jsonify({"error": "No se encontró estado del robot"})
+            
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @app.route('/api/comando/<accion>')
 def enviar_comando(accion):
     """Comandos generales: ON, OFF, STOP, RESET, ABRIR, CERRAR"""
     try:
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "INSERT INTO comandos_robot (esp32_id, comando) VALUES (%s, %s)",
-            ('CDBOT_001', accion.upper())
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
+        crear_comando(accion.upper())
         return jsonify({"status": "success", "comando": accion})
-        
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -660,20 +784,7 @@ def cambiar_conexion():
         data = request.json
         modo = data.get('modo')
         
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "INSERT INTO comandos_robot (esp32_id, comando, modo_conexion) VALUES (%s, %s, %s)",
-            ('CDBOT_001', f'MODE:{modo}', modo)
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
+        crear_comando(f'MODE:{modo}', modo_conexion=modo)
         return jsonify({"status": "success", "mensaje": f"Modo cambiado a {modo}"})
         
     except Exception as e:
@@ -684,32 +795,17 @@ def mover_motor():
     """Mover motor específico con pasos y dirección"""
     try:
         data = request.json
-        motor = data.get('motor')
-        pasos = data.get('pasos')
-        velocidad = data.get('velocidad')
-        direccion = data.get('direccion')
-        
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            """INSERT INTO comandos_robot 
-            (esp32_id, comando, motor_num, pasos, velocidad, direccion) 
-            VALUES (%s, %s, %s, %s, %s, %s)""",
-            ('CDBOT_001', 'MOVER_MOTOR', motor, pasos, velocidad, direccion)
+        crear_comando(
+            'MOVER_MOTOR',
+            motor_num=data.get('motor'),
+            pasos=data.get('pasos'),
+            velocidad=data.get('velocidad'),
+            direccion=data.get('direccion')
         )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
         return jsonify({
             "status": "success", 
-            "mensaje": f"Motor M{motor} movido {direccion}"
+            "mensaje": f"Motor M{data.get('motor')} movido {data.get('direccion')}"
         })
-        
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -719,27 +815,16 @@ def mover_posicion():
     try:
         data = request.json
         posiciones = data.get('posiciones', [])
-        velocidad = data.get('velocidad', 500)
         
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            """INSERT INTO comandos_robot 
-            (esp32_id, comando, posicion_m1, posicion_m2, posicion_m3, posicion_m4, velocidad) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-            ('CDBOT_001', 'MOVIMIENTO_POSICION', 
-             posiciones[0], posiciones[1], posiciones[2], posiciones[3], velocidad)
+        crear_comando(
+            'MOVIMIENTO_POSICION',
+            posicion_m1=posiciones[0],
+            posicion_m2=posiciones[1],
+            posicion_m3=posiciones[2],
+            posicion_m4=posiciones[3],
+            velocidad=data.get('velocidad', 500)
         )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
         return jsonify({"status": "success", "mensaje": "Movimiento a posición ejecutado"})
-        
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -748,28 +833,26 @@ def guardar_posicion():
     """Guardar posición en la base de datos"""
     try:
         data = request.json
-        nombre = data.get('nombre')
-        posiciones = data.get('posiciones', [])
-        velocidad = data.get('velocidad', 500)
-        
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            """INSERT INTO posiciones_guardadas 
+        ejecutar_consulta('''
+            INSERT INTO posiciones_guardadas 
             (nombre, posicion_m1, posicion_m2, posicion_m3, posicion_m4, velocidad) 
-            VALUES (%s, %s, %s, %s, %s, %s)""",
-            (nombre, posiciones[0], posiciones[1], posiciones[2], posiciones[3], velocidad)
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (nombre) DO UPDATE SET
+            posicion_m1 = EXCLUDED.posicion_m1,
+            posicion_m2 = EXCLUDED.posicion_m2,
+            posicion_m3 = EXCLUDED.posicion_m3,
+            posicion_m4 = EXCLUDED.posicion_m4,
+            velocidad = EXCLUDED.velocidad
+        ''', (
+            data.get('nombre'),
+            data.get('posiciones')[0],
+            data.get('posiciones')[1],
+            data.get('posiciones')[2],
+            data.get('posiciones')[3],
+            data.get('velocidad', 500)
+        ))
         
-        return jsonify({"status": "success", "mensaje": f"Posición '{nombre}' guardada"})
-        
+        return jsonify({"status": "success", "mensaje": f"Posición '{data.get('nombre')}' guardada"})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -777,32 +860,27 @@ def guardar_posicion():
 def obtener_posiciones():
     """Obtener lista de posiciones guardadas"""
     try:
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
+        posiciones = ejecutar_consulta(
+            "SELECT * FROM posiciones_guardadas ORDER BY nombre",
+            fetch=True
+        )
+        
+        if posiciones:
+            posiciones_list = []
+            for pos in posiciones:
+                posiciones_list.append({
+                    "id": pos['id'],
+                    "nombre": pos['nombre'],
+                    "posicion_m1": float(pos['posicion_m1']),
+                    "posicion_m2": float(pos['posicion_m2']),
+                    "posicion_m3": float(pos['posicion_m3']),
+                    "posicion_m4": float(pos['posicion_m4']),
+                    "velocidad": int(pos['velocidad'])
+                })
+            return jsonify({"status": "success", "posiciones": posiciones_list})
+        else:
+            return jsonify({"status": "success", "posiciones": []})
             
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT * FROM posiciones_guardadas ORDER BY nombre")
-        posiciones = cursor.fetchall()
-        
-        cursor.close()
-        conn.close()
-        
-        posiciones_list = []
-        for pos in posiciones:
-            posiciones_list.append({
-                "id": pos[0],
-                "nombre": pos[1],
-                "posicion_m1": float(pos[2]),
-                "posicion_m2": float(pos[3]),
-                "posicion_m3": float(pos[4]),
-                "posicion_m4": float(pos[5]),
-                "velocidad": int(pos[7])
-            })
-        
-        return jsonify({"status": "success", "posiciones": posiciones_list})
-        
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -810,32 +888,26 @@ def obtener_posiciones():
 def cargar_posicion(posicion_id):
     """Cargar una posición específica"""
     try:
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT * FROM posiciones_guardadas WHERE id = %s", (posicion_id,))
-        posicion = cursor.fetchone()
-        
-        cursor.close()
-        conn.close()
+        posicion = ejecutar_consulta(
+            "SELECT * FROM posiciones_guardadas WHERE id = %s",
+            (posicion_id,),
+            fetch=True
+        )
         
         if posicion:
+            posicion = posicion[0]
             posicion_data = {
-                "id": posicion[0],
-                "nombre": posicion[1],
-                "posicion_m1": float(posicion[2]),
-                "posicion_m2": float(posicion[3]),
-                "posicion_m3": float(posicion[4]),
-                "posicion_m4": float(posicion[5]),
-                "velocidad": int(posicion[7])
+                "id": posicion['id'],
+                "nombre": posicion['nombre'],
+                "posicion_m1": float(posicion['posicion_m1']),
+                "posicion_m2": float(posicion['posicion_m2']),
+                "posicion_m3": float(posicion['posicion_m3']),
+                "posicion_m4": float(posicion['posicion_m4']),
+                "velocidad": int(posicion['velocidad'])
             }
             return jsonify({"status": "success", "posicion": posicion_data})
         else:
             return jsonify({"status": "error", "error": "Posición no encontrada"})
-            
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -843,53 +915,11 @@ def cargar_posicion(posicion_id):
 def eliminar_posicion(posicion_id):
     """Eliminar una posición guardada"""
     try:
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        cursor.execute("DELETE FROM posiciones_guardadas WHERE id = %s", (posicion_id,))
-        conn.commit()
-        
-        cursor.close()
-        conn.close()
-        
+        ejecutar_consulta(
+            "DELETE FROM posiciones_guardadas WHERE id = %s",
+            (posicion_id,)
+        )
         return jsonify({"status": "success", "mensaje": "Posición eliminada"})
-        
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
-@app.route('/api/estado')
-def obtener_estado():
-    """Obtener estado actual del robot"""
-    try:
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT * FROM moduls_tellis WHERE esp32_id = 'CDBOT_001' ORDER BY timestamp DESC LIMIT 1")
-        estado = cursor.fetchone()
-        
-        cursor.close()
-        conn.close()
-        
-        if estado:
-            return jsonify({
-                "motores_activos": bool(estado[2]),
-                "emergency_stop": bool(estado[3]), 
-                "posicion_m1": float(estado[4]),
-                "posicion_m2": float(estado[5]),
-                "posicion_m3": float(estado[6]),
-                "posicion_m4": float(estado[7]),
-                "garra_abierta": bool(estado[8]),
-                "velocidad_actual": int(estado[9])
-            })
-        else:
-            return jsonify({"error": "No se encontró estado del robot"})
-            
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -898,50 +928,22 @@ def obtener_estado():
 def obtener_comandos_pendientes(esp32_id):
     """Obtener comandos pendientes para un ESP32"""
     try:
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        # Obtener comandos no ejecutados
-        cursor.execute(
-            "SELECT * FROM comandos_robot WHERE esp32_id = %s AND (ejecutado IS NULL OR ejecutado = FALSE) ORDER BY timestamp ASC LIMIT 10",
-            (esp32_id,)
+        comandos = ejecutar_consulta(
+            "SELECT * FROM comandos_robot WHERE esp32_id = %s AND ejecutado = FALSE ORDER BY timestamp ASC LIMIT 10",
+            (esp32_id,),
+            fetch=True
         )
-        comandos = cursor.fetchall()
         
-        comandos_list = []
-        for cmd in comandos:
-            comando_data = {
-                "id": cmd[0],
-                "comando": cmd[2],
-                "motor_num": cmd[4],
-                "pasos": cmd[5],
-                "velocidad": cmd[6],
-                "direccion": cmd[7],
-                "posicion_m1": cmd[8],
-                "posicion_m2": cmd[9],
-                "posicion_m3": cmd[10],
-                "posicion_m4": cmd[11]
-            }
-            comandos_list.append(comando_data)
-        
-        # Marcar como ejecutados
         if comandos:
-            ids = [str(cmd[0]) for cmd in comandos]
+            # Marcar como ejecutados
+            ids = [str(cmd['id']) for cmd in comandos]
             placeholders = ','.join(['%s'] * len(ids))
-            cursor.execute(
+            ejecutar_consulta(
                 f"UPDATE comandos_robot SET ejecutado = TRUE WHERE id IN ({placeholders})",
                 ids
             )
-            conn.commit()
         
-        cursor.close()
-        conn.close()
-        
-        return jsonify({"status": "success", "comandos": comandos_list})
-        
+        return jsonify({"status": "success", "comandos": comandos or []})
     except Exception as e:
         print(f"❌ Error en comandos_pendientes: {e}")
         return jsonify({"status": "error", "error": str(e)}), 500
@@ -956,47 +958,50 @@ def actualizar_estado():
             
         print(f"📊 Estado recibido del ESP32: {data}")
         
-        conn = get_db_connection()
-        if conn is None:
-            return jsonify({"status": "error", "error": "No database connection"}), 500
-            
-        cursor = conn.cursor()
-        
-        # Para PostgreSQL usamos INSERT con ON CONFLICT
-        cursor.execute('''
-            INSERT INTO moduls_tellis 
-            (esp32_id, motores_activos, emergency_stop, posicion_m1, posicion_m2, posicion_m3, posicion_m4, garra_abierta, velocidad_actual) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (esp32_id) DO UPDATE SET
-            motores_activos = EXCLUDED.motores_activos,
-            emergency_stop = EXCLUDED.emergency_stop,
-            posicion_m1 = EXCLUDED.posicion_m1,
-            posicion_m2 = EXCLUDED.posicion_m2,
-            posicion_m3 = EXCLUDED.posicion_m3,
-            posicion_m4 = EXCLUDED.posicion_m4,
-            garra_abierta = EXCLUDED.garra_abierta,
-            velocidad_actual = EXCLUDED.velocidad_actual,
-            timestamp = CURRENT_TIMESTAMP
-        ''', (
-            data.get('esp32_id', 'CDBOT_001'),
-            data.get('motors_active', False),
-            data.get('emergency_stop', False),
-            data.get('motor1_deg', 0),
-            data.get('motor2_deg', 0), 
-            data.get('motor3_deg', 0),
-            data.get('motor4_deg', 0),
-            data.get('garra_state') == 'ABIERTA',
-            data.get('velocidad_actual', 500)
-        ))
-        
-        conn.commit()
-        cursor.close()
-        conn.close()
+        actualizar_estado_robot(
+            motores_activos=data.get('motors_active', False),
+            emergency_stop=data.get('emergency_stop', False),
+            posicion_m1=data.get('motor1_deg', 0),
+            posicion_m2=data.get('motor2_deg', 0),
+            posicion_m3=data.get('motor3_deg', 0),
+            posicion_m4=data.get('motor4_deg', 0),
+            garra_abierta=data.get('garra_state') == 'ABIERTA',
+            velocidad_actual=data.get('velocidad_actual', 500)
+        )
         
         return jsonify({"status": "success", "message": "Estado actualizado"})
-        
     except Exception as e:
         print(f"❌ Error actualizando estado: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route('/api/estadisticas')
+def obtener_estadisticas():
+    """Obtener estadísticas del sistema"""
+    try:
+        total_comandos = ejecutar_consulta(
+            "SELECT COUNT(*) as total FROM comandos_robot",
+            fetch=True
+        )
+        
+        comandos_hoy = ejecutar_consulta(
+            "SELECT COUNT(*) as total FROM comandos_robot WHERE DATE(timestamp) = CURRENT_DATE",
+            fetch=True
+        )
+        
+        ultima_actualizacion = ejecutar_consulta(
+            "SELECT MAX(actualizado_en) as ultima FROM moduls_tellis",
+            fetch=True
+        )
+        
+        return jsonify({
+            "status": "success",
+            "estadisticas": {
+                "total_comandos": total_comandos[0]['total'] if total_comandos else 0,
+                "comandos_hoy": comandos_hoy[0]['total'] if comandos_hoy else 0,
+                "ultima_actualizacion": ultima_actualizacion[0]['ultima'] if ultima_actualizacion else None
+            }
+        })
+    except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route('/api/test')
@@ -1004,13 +1009,13 @@ def test_api():
     """Ruta de prueba"""
     return jsonify({
         "status": "success", 
-        "message": "✅ API funcionando correctamente",
-        "timestamp": time.time()
+        "message": "✅ API Flask + PostgreSQL funcionando correctamente",
+        "timestamp": datetime.now().isoformat(),
+        "base_datos": "PostgreSQL"
     })
 
 # ======================= INICIALIZACIÓN =======================
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Iniciando Dashboard conectado a PostgreSQL...")
+    print(f"🚀 Iniciando Dashboard Flask con PostgreSQL en puerto {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
-   
